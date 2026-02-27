@@ -23,7 +23,33 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskType int
 
+const (
+	MapTask TaskType = iota
+	ReduceTask
+	WaitTask
+	ExitTask
+)
+
+type RequestArgs struct {
+}
+
+type RequestReply struct {
+	ID        int      // 任务ID
+	Type      TaskType // 任务类型
+	FileName  string   // map任务的输入文件
+	NumMap    int      // map任务的总数
+	NumReduce int      // reduce任务的总数
+}
+
+type ReportArgs struct {
+	Type TaskType // 任务类型
+	ID   int      // 任务ID
+	Ok   bool     // 任务是否成功完成
+}
+
+type ReportReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
