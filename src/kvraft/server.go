@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -51,7 +52,8 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate             int // snapshot if log grows this big
+	lastAppliedSnapshotIndex int
 
 	// Your definitions here.
 	kvDB        map[string]string     // kv存储
@@ -154,6 +156,40 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 }
 
+// 生成snapshot
+func (kv *KVServer) makeSnapshot() []byte {
+	// snapshot中需要保存kvDB和lastRequest
+	// kv.mu.Lock()
+	// defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvDB)
+	e.Encode(kv.lastRequest)
+
+	return w.Bytes()
+}
+
+// 读取snapshot
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var kvDB map[string]string
+	var lastRequest map[int64]LastOp
+
+	if d.Decode(&kvDB) != nil || d.Decode(&lastRequest) != nil {
+		panic("Failed to decode snapshot")
+	} else {
+		kv.kvDB = kvDB
+		kv.lastRequest = lastRequest
+	}
+}
+
 func (kv *KVServer) applier() {
 	for !kv.killed() {
 		select {
@@ -165,7 +201,16 @@ func (kv *KVServer) applier() {
 }
 
 func (kv *KVServer) apply(msg raft.ApplyMsg) {
-	if !msg.CommandValid {
+	if !msg.CommandValid && msg.SnapshotValid {
+		kv.mu.Lock()
+		if msg.SnapshotIndex <= kv.lastAppliedSnapshotIndex {
+			kv.mu.Unlock()
+			return
+		}
+		kv.lastAppliedSnapshotIndex = msg.SnapshotIndex
+		kv.readSnapshot(msg.Snapshot)
+		kv.notifyChs = make(map[int]chan OpResult) // 读取snapshot后之前的notifyChs都失效了，需要重置
+		kv.mu.Unlock()
 		return
 	}
 
@@ -178,6 +223,15 @@ func (kv *KVServer) apply(msg raft.ApplyMsg) {
 	kv.mu.Unlock()
 	if ok && op.RequestID <= lastOp.RequestID {
 		// 已经处理过这个请求，直接返回上一次的结果
+		kv.mu.Lock()
+		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+			snapshot := kv.makeSnapshot()
+			kv.rf.Snapshot(msg.CommandIndex, snapshot)
+		}
+
+		kv.lastAppliedSnapshotIndex= msg.CommandIndex
+		kv.mu.Unlock()
+
 		if chExist {
 			ch <- lastOp.Result
 		}
@@ -213,7 +267,14 @@ func (kv *KVServer) apply(msg raft.ApplyMsg) {
 		RequestID: op.RequestID,
 		Result:    result,
 	}
+
+	if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+		snapshot := kv.makeSnapshot()
+		kv.rf.Snapshot(msg.CommandIndex, snapshot)
+	}
+
 	// ch, ok := kv.notifyChs[msg.CommandIndex]
+	kv.lastAppliedSnapshotIndex= msg.CommandIndex
 	kv.mu.Unlock()
 	// 通过notifyChs通知等待的请求处理结果
 	if chExist {
@@ -270,6 +331,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.notifyChs = make(map[int]chan OpResult)
 
 	// You may need initialization code here.
+	kv.readSnapshot(persister.ReadSnapshot())
 	go kv.applier()
 
 	return kv
