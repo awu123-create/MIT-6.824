@@ -12,6 +12,10 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+
+	clientID  int64
+	requestID int64
+	leaderID  int
 }
 
 func nrand() int64 {
@@ -25,13 +29,19 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.clientID = nrand()
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
+	ck.requestID++
+	args := &QueryArgs{
+		ClientID:  ck.clientID,
+		RequestID: ck.requestID,
+		Num:       num,
+	}
 	// Your code here.
-	args.Num = num
+
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -40,15 +50,20 @@ func (ck *Clerk) Query(num int) Config {
 			if ok && reply.WrongLeader == false {
 				return reply.Config
 			}
+
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
+	ck.requestID++
+	args := &JoinArgs{
+		ClientID:  ck.clientID,
+		RequestID: ck.requestID,
+		Servers:   servers,
+	}
 	// Your code here.
-	args.Servers = servers
 
 	for {
 		// try each known server.
@@ -58,15 +73,20 @@ func (ck *Clerk) Join(servers map[int][]string) {
 			if ok && reply.WrongLeader == false {
 				return
 			}
+
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
+	ck.requestID++
+	args := &LeaveArgs{
+		ClientID:  ck.clientID,
+		RequestID: ck.requestID,
+		GIDs:      gids,
+	}
 	// Your code here.
-	args.GIDs = gids
 
 	for {
 		// try each known server.
@@ -76,16 +96,21 @@ func (ck *Clerk) Leave(gids []int) {
 			if ok && reply.WrongLeader == false {
 				return
 			}
+
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
+	ck.requestID++
+	args := &MoveArgs{
+		ClientID:  ck.clientID,
+		RequestID: ck.requestID,
+		Shard:     shard,
+		GID:       gid,
+	}
 	// Your code here.
-	args.Shard = shard
-	args.GID = gid
 
 	for {
 		// try each known server.
@@ -95,6 +120,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 			if ok && reply.WrongLeader == false {
 				return
 			}
+
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
