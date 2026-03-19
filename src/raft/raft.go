@@ -210,7 +210,7 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// 此时需要将日志中index之前的日志都丢弃掉，并且更新lastIncludedIndex和lastIncludedTerm，同时还要停止apply goroutine
+	// 此时需要将日志中index之前的日志都丢弃掉，并且更新lastIncludedIndex和lastIncludedTerm
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -235,7 +235,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// 持久化
 	state := rf.encodeState()
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
-	return
 }
 
 func (rf *Raft) GetRaftStateSize() int {
@@ -1444,12 +1443,12 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 
 		entries := make([]ApplyMsg, 0)
 		if rf.hasSnapshot {
-			entries=append(entries,ApplyMsg{
-				CommandValid:false,
-				SnapshotValid:true,
-				Snapshot:rf.snapshot,
-				SnapshotIndex:rf.snapshotIndex,
-				SnapshotTerm:rf.snapshotTerm,
+			entries = append(entries, ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotIndex: rf.snapshotIndex,
+				SnapshotTerm:  rf.snapshotTerm,
 			})
 		}
 
