@@ -11,6 +11,7 @@ package shardkv
 
 const (
 	OK             = "OK"
+	Duplicate      = "Duplicate"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
@@ -46,4 +47,24 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type PullShardArgs struct {
+	ConfigNum int
+	ShardIDs  []int
+}
+
+type PullShardReply struct {
+	LastRequest map[int64]LastOp
+	ShardData   map[int]map[string]string
+	Err         Err
+}
+
+type GCArgs struct {
+	ConfigNum int
+	ShardIDs  []int
+}
+
+type GCReply struct {
+	Err Err
 }

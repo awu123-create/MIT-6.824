@@ -23,7 +23,11 @@ type Op struct {
 	ClientID  int64
 	RequestID int64
 
-	Config shardmaster.Config
+	Config      shardmaster.Config
+	Data        map[int]map[string]string
+	LastRequest map[int64]LastOp
+	ConfigNum   int
+	ShardIDs    []int
 }
 
 type OpResult struct {
@@ -61,19 +65,26 @@ type ShardKV struct {
 	lastRequest map[int64]LastOp
 	notifyCh    map[int]chan OpResult
 
-	mck                      *shardmaster.Clerk
-	kvDB                     map[string]string
+	mck *shardmaster.Clerk
+
+	// shard -> (key -> value)
+	kvDB                     map[int]map[string]string
 	lastAppliedSnapshotIndex int
 
+	// 当前配置和上一个配置，迁移数据时需要知道上一个配置的情况
 	currentConfig shardmaster.Config
 	lastConfig    shardmaster.Config
 	shardState    map[int]ShardState
 }
 
 func (kv *ShardKV) canServe(key string) bool {
-	shard := key2shard(key)
+	// 现在这里的逻辑是：只有当迁移完成后，并且当前shard归我管，才可以提供服务
+	if !kv.migrationFinsished() {
+		return false
+	}
 
-	return kv.currentConfig.Shards[shard] == kv.gid
+	shard := key2shard(key)
+	return kv.currentConfig.Shards[shard] == kv.gid && kv.shardState[shard] == Serving
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -176,6 +187,99 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
+func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if args.ConfigNum != kv.currentConfig.Num {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	// 此时旧组应该将待迁移的shard数据组织好，并且将数据和lastRequest一起发给新组
+	tempData := make(map[int]map[string]string)
+	for _, shard := range args.ShardIDs {
+		if kv.shardState[shard] != BePushing {
+			reply.Err = ErrWrongGroup
+			return
+		}
+
+		tempData[shard] = make(map[string]string)
+		for k, v := range kv.kvDB[shard] {
+			tempData[shard][k] = v
+		}
+	}
+	reply.ShardData = tempData
+
+	lastRequest := make(map[int64]LastOp)
+	for clientID, lastOp := range kv.lastRequest {
+		lastRequest[clientID] = lastOp
+	}
+	reply.LastRequest = lastRequest
+
+	reply.Err = OK
+}
+
+func (kv *ShardKV) GC(args *GCArgs, reply *GCReply) {
+	kv.mu.Lock()
+	if args.ConfigNum != kv.currentConfig.Num {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
+	// 新组通知旧组可以将对应shard的状态从BePushing改成Serving了
+	for _, shard := range args.ShardIDs {
+		if kv.shardState[shard] == BePulling {
+			reply.Err = ErrWrongGroup
+			kv.mu.Unlock()
+			return
+		}
+	}
+	kv.mu.Unlock()
+
+	id := make([]int, len(args.ShardIDs))
+	copy(id, args.ShardIDs)
+
+	op := Op{
+		Type:      "GC",
+		ConfigNum: args.ConfigNum,
+		ShardIDs:  id,
+	}
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, stillLeader := kv.rf.GetState()
+		if !stillLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		done := true
+		kv.mu.Lock()
+		for _, shard := range args.ShardIDs {
+			if kv.shardState[shard] != Serving {
+				done = false
+				break
+			}
+		}
+		kv.mu.Unlock()
+
+		if done {
+			reply.Err = OK
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 超时了可能是leader发生了变化，也可能是网络问题等导致的
+	reply.Err = ErrWrongLeader
+}
+
 func (kv *ShardKV) applier() {
 	for !kv.killed() {
 		select {
@@ -221,9 +325,12 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 	kv.mu.Unlock()
 
 	if ok && lastOp.RequestID >= op.RequestID && (op.Type == "Get" || op.Type == "Put" || op.Type == "Append") {
+		kv.mu.Lock()
 		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
 			kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
 		}
+		kv.lastAppliedSnapshotIndex = msg.CommandIndex
+		kv.mu.Unlock()
 
 		if chExist {
 			ch <- lastOp.Result
@@ -234,10 +341,7 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 
 	switch op.Type {
 	case "Get", "Put", "Append":
-		result := kv.applyClientRequest(op)
-		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
-			kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
-		}
+		result := kv.applyClientRequest(op, key2shard(op.Key))
 
 		if chExist {
 			ch <- result
@@ -247,13 +351,115 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 		// 此时需要更新当前配置
 		kv.mu.Lock()
 		if op.Config.Num == kv.currentConfig.Num+1 {
+			kv.lastConfig = kv.currentConfig
 			kv.currentConfig = op.Config
+
+			for i := 0; i < shardmaster.NShards; i++ {
+				/*
+					逐个计算shard的状态:
+						1. 如果shard原来和现在都归我 -> Serving
+						2. 如果shard原来归我，现在不归我 -> BePushing
+						3. 如果shard原来不归我，现在归我 -> BePulling
+						4. 如果shard现在归我，原来没人管 -> Serving
+				*/
+				if kv.lastConfig.Shards[i] == kv.gid && kv.currentConfig.Shards[i] == kv.gid {
+					kv.shardState[i] = Serving
+				} else if kv.lastConfig.Shards[i] == kv.gid && kv.currentConfig.Shards[i] != kv.gid {
+					kv.shardState[i] = BePushing
+				} else if kv.lastConfig.Shards[i] == 0 && kv.currentConfig.Shards[i] == kv.gid {
+					kv.shardState[i] = Serving
+				} else if kv.lastConfig.Shards[i] != kv.gid && kv.currentConfig.Shards[i] == kv.gid {
+					kv.shardState[i] = BePulling
+				}
+			}
+		}
+		kv.mu.Unlock()
+
+	case "Pull":
+		kv.mu.Lock()
+		if op.ConfigNum != kv.currentConfig.Num {
+			kv.mu.Unlock()
+			return
+		}
+
+		gcSend := make(map[int][]int) // gid -> []shard
+		for shard, data := range op.Data {
+			if kv.shardState[shard] == BePulling {
+				tempData := make(map[string]string)
+				for k, v := range data {
+					tempData[k] = v
+				}
+				kv.kvDB[shard] = tempData
+				kv.shardState[shard] = Serving
+
+				gid := kv.lastConfig.Shards[shard]
+				if gcSend[gid] == nil {
+					gcSend[gid] = make([]int, 0)
+				}
+				gcSend[gid] = append(gcSend[gid], shard)
+			}
+		}
+
+		for clientID, lastOp := range op.LastRequest {
+			if lastOp.RequestID > kv.lastRequest[clientID].RequestID {
+				kv.lastRequest[clientID] = lastOp
+			}
+		}
+
+		lastConfig := kv.lastConfig
+		kv.mu.Unlock()
+
+		// 拉取数据完成后，通知旧组可以GC了
+		for gid, shards := range gcSend {
+			args := GCArgs{
+				ConfigNum: op.ConfigNum,
+				ShardIDs:  shards,
+			}
+			servers := lastConfig.Groups[gid]
+
+			go func(servers []string, args *GCArgs) {
+				for {
+					for _, server := range servers {
+						reply := GCReply{}
+						ok := kv.make_end(server).Call("ShardKV.GC", args, &reply)
+						if ok && reply.Err == OK {
+							return
+						}
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}(servers, &args)
+		}
+
+	case "GC":
+		// 需要修改shardState
+		kv.mu.Lock()
+		if op.ConfigNum != kv.currentConfig.Num {
+			kv.mu.Unlock()
+			return
+		}
+
+		for _, shard := range op.ShardIDs {
+			if kv.shardState[shard] == BePushing {
+				kv.shardState[shard] = Serving
+
+				// 清空数据
+				kv.kvDB[shard] = make(map[string]string)
+			}
 		}
 		kv.mu.Unlock()
 	}
+
+	kv.mu.Lock()
+	if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+		kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
+	}
+	kv.lastAppliedSnapshotIndex = msg.CommandIndex
+	kv.mu.Unlock()
+
 }
 
-func (kv *ShardKV) applyClientRequest(op Op) OpResult {
+func (kv *ShardKV) applyClientRequest(op Op, shard int) OpResult {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -264,7 +470,7 @@ func (kv *ShardKV) applyClientRequest(op Op) OpResult {
 
 	switch op.Type {
 	case "Get":
-		value, ok := kv.kvDB[op.Key]
+		value, ok := kv.kvDB[shard][op.Key]
 		if ok {
 			result.Err = OK
 			result.Value = value
@@ -272,10 +478,10 @@ func (kv *ShardKV) applyClientRequest(op Op) OpResult {
 			result.Err = ErrNoKey
 		}
 	case "Put":
-		kv.kvDB[op.Key] = op.Value
+		kv.kvDB[shard][op.Key] = op.Value
 		result.Err = OK
 	case "Append":
-		kv.kvDB[op.Key] += op.Value
+		kv.kvDB[shard][op.Key] += op.Value
 		result.Err = OK
 	}
 
@@ -300,6 +506,10 @@ func (kv *ShardKV) ticker() {
 		}
 
 		// 在当前配置下shard迁移完成后，才可以拉取新的配置
+		if !kv.migrationFinsished() {
+			continue
+		}
+
 		// 拉取Config.Num+1的配置，避免不知道该如何迁移数据的情况发生
 		kv.mu.Lock()
 		num := kv.currentConfig.Num
@@ -316,12 +526,87 @@ func (kv *ShardKV) ticker() {
 	}
 }
 
+func (kv *ShardKV) puller() {
+	for !kv.killed() {
+		time.Sleep(100 * time.Millisecond)
+
+		kv.mu.Lock()
+		_, isLeader := kv.rf.GetState()
+		kv.mu.Unlock()
+
+		if !isLeader {
+			continue
+		}
+
+		kv.mu.Lock()
+		if kv.migrationFinsished() {
+			kv.mu.Unlock()
+			continue
+		}
+
+		// 拉取数据
+		// 先计算出需要拉取数据的shard和对应的gid
+		id := make(map[int][]int, shardmaster.NShards)
+		for i := 0; i < shardmaster.NShards; i++ {
+			id[i] = make([]int, 0)
+		}
+		for shard, state := range kv.shardState {
+			if state == BePulling {
+				gid := kv.lastConfig.Shards[shard]
+				id[gid] = append(id[gid], shard)
+			}
+		}
+
+		currentConfig := kv.currentConfig
+		lastConfig := kv.lastConfig
+		kv.mu.Unlock()
+
+		for gid, shards := range id {
+			if len(shards) == 0 {
+				continue
+			}
+
+			args := PullShardArgs{
+				ConfigNum: currentConfig.Num,
+				ShardIDs:  shards,
+			}
+
+			servers := lastConfig.Groups[gid]
+			for _, server := range servers {
+				reply := PullShardReply{}
+				ok := kv.make_end(server).Call("ShardKV.PullShard", &args, &reply)
+				if ok && reply.Err == OK {
+					op := Op{
+						Type:        "Pull",
+						Data:        reply.ShardData,
+						LastRequest: reply.LastRequest,
+						ConfigNum:   currentConfig.Num,
+					}
+					kv.rf.Start(op)
+					break
+				}
+			}
+		}
+	}
+}
+
+func (kv *ShardKV) migrationFinsished() bool {
+	for i := 0; i < shardmaster.NShards; i++ {
+		if kv.shardState[i] == BePulling || kv.shardState[i] == BePushing {
+			return false
+		}
+	}
+	return true
+}
+
 func (kv *ShardKV) makeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.kvDB)
 	e.Encode(kv.lastRequest)
 	e.Encode(kv.currentConfig)
+	e.Encode(kv.lastConfig)
+	e.Encode(kv.shardState)
 
 	return w.Bytes()
 }
@@ -334,16 +619,21 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
-	var kvDB map[string]string
+	var kvDB map[int]map[string]string
 	var lastRequest map[int64]LastOp
 	var currentConfig shardmaster.Config
+	var lastConfig shardmaster.Config
+	var shardState map[int]ShardState
 
-	if d.Decode(&kvDB) != nil || d.Decode(&lastRequest) != nil || d.Decode(&currentConfig) != nil {
+	if d.Decode(&kvDB) != nil || d.Decode(&lastRequest) != nil || d.Decode(&currentConfig) != nil ||
+		d.Decode(&lastConfig) != nil || d.Decode(&shardState) != nil {
 		panic("failed to read snapshot")
 	} else {
 		kv.kvDB = kvDB
 		kv.lastRequest = lastRequest
 		kv.currentConfig = currentConfig
+		kv.lastConfig = lastConfig
+		kv.shardState = shardState
 	}
 }
 
@@ -405,16 +695,26 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastRequest = make(map[int64]LastOp)
 	kv.notifyCh = make(map[int]chan OpResult)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
-	kv.kvDB = make(map[string]string)
+	kv.kvDB = make(map[int]map[string]string)
+	for i := 0; i < shardmaster.NShards; i++ {
+		kv.kvDB[i] = make(map[string]string)
+	}
+
+	kv.shardState = make(map[int]ShardState)
+	for i := 0; i < shardmaster.NShards; i++ {
+		kv.shardState[i] = Serving
+	}
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.readSnapshot(persister.ReadSnapshot())
 
 	go kv.applier()
 	go kv.ticker()
+	go kv.puller()
 
 	return kv
 }
