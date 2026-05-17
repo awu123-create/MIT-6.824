@@ -23,7 +23,7 @@ type ShardMaster struct {
 
 	// 去重
 	lastRequest map[int64]LastOp      // key: ClientID
-	notifyCh    map[int]chan OpResult // key: RequestID
+	notifyCh    map[int]chan OpResult
 }
 
 type CommandType int
@@ -67,93 +67,73 @@ type Op struct {
 	Num int
 }
 
+func (sm *ShardMaster) submitAndWait(op Op) (OpResult, bool) {
+	index, _, isLeader := sm.rf.Start(op)
+	if !isLeader {
+		return OpResult{}, false
+	}
+
+	sm.mu.Lock()
+	ch, ok := sm.notifyCh[index]
+	if !ok {
+		ch = make(chan OpResult, 1)
+		sm.notifyCh[index] = ch
+	}
+	sm.mu.Unlock()
+
+	defer func() {
+		sm.mu.Lock()
+		delete(sm.notifyCh, index)
+		sm.mu.Unlock()
+	}()
+
+	select {
+	case result := <-ch:
+		if result.ClientID == op.ClientID && result.RequestID == op.RequestID {
+			return result, true
+		}
+		return OpResult{}, false
+	case <-time.After(100 * time.Millisecond):
+		return OpResult{}, false
+	}
+}
+
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
-	Op := Op{
+	op := Op{
 		Type:      Join,
 		ClientID:  args.ClientID,
 		RequestID: args.RequestID,
 		Servers:   args.Servers,
 	}
 
-	index, _, isLeader := sm.rf.Start(Op)
-	if !isLeader {
-		reply.WrongLeader = true
-		return
-	}
-
-	sm.mu.Lock()
-	ch, ok := sm.notifyCh[index]
-	if !ok {
-		ch = make(chan OpResult, 1)
-		sm.notifyCh[index] = ch
-	}
-	sm.mu.Unlock()
-
-	defer func() {
-		sm.mu.Lock()
-		delete(sm.notifyCh, index)
-		sm.mu.Unlock()
-	}()
-
-	select {
-	case result := <-ch:
-		if result.ClientID == args.ClientID && result.RequestID == args.RequestID {
-			reply.WrongLeader = false
-			reply.Err = result.Err
-		} else {
-			reply.WrongLeader = true
-		}
-	case <-time.After(100 * time.Millisecond):
+	result, ok := sm.submitAndWait(op)
+	if ok {
+		reply.WrongLeader = false
+		reply.Err = result.Err
+	} else {
 		reply.WrongLeader = true
 	}
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
-	Op := Op{
+	op := Op{
 		Type:      Leave,
 		ClientID:  args.ClientID,
 		RequestID: args.RequestID,
 		GIDs:      args.GIDs,
 	}
 
-	index, _, isLeader := sm.rf.Start(Op)
-	if !isLeader {
-		reply.WrongLeader = true
-		return
-	}
-
-	sm.mu.Lock()
-	ch, ok := sm.notifyCh[index]
-	if !ok {
-		ch = make(chan OpResult, 1)
-		sm.notifyCh[index] = ch
-	}
-	sm.mu.Unlock()
-
-	defer func() {
-		sm.mu.Lock()
-		delete(sm.notifyCh, index)
-		sm.mu.Unlock()
-	}()
-
-	select {
-	case result := <-ch:
-		if result.ClientID == args.ClientID && result.RequestID == args.RequestID {
-			reply.WrongLeader = false
-			reply.Err = result.Err
-		} else {
-			reply.WrongLeader = true
-		}
-	case <-time.After(100 * time.Millisecond):
+	result, ok := sm.submitAndWait(op)
+	if ok {
+		reply.WrongLeader = false
+		reply.Err = result.Err
+	} else {
 		reply.WrongLeader = true
 	}
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
-	Op := Op{
+	op := Op{
 		Type:      Move,
 		ClientID:  args.ClientID,
 		RequestID: args.RequestID,
@@ -161,78 +141,29 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 		GID:       args.GID,
 	}
 
-	index, _, isLeader := sm.rf.Start(Op)
-	if !isLeader {
-		reply.WrongLeader = true
-		return
-	}
-
-	sm.mu.Lock()
-	ch, ok := sm.notifyCh[index]
-	if !ok {
-		ch = make(chan OpResult, 1)
-		sm.notifyCh[index] = ch
-	}
-	sm.mu.Unlock()
-
-	defer func() {
-		sm.mu.Lock()
-		delete(sm.notifyCh, index)
-		sm.mu.Unlock()
-	}()
-
-	select {
-	case result := <-ch:
-		if result.ClientID == args.ClientID && result.RequestID == args.RequestID {
-			reply.WrongLeader = false
-			reply.Err = result.Err
-		} else {
-			reply.WrongLeader = true
-		}
-	case <-time.After(100 * time.Millisecond):
+	result, ok := sm.submitAndWait(op)
+	if ok {
+		reply.WrongLeader = false
+		reply.Err = result.Err
+	} else {
 		reply.WrongLeader = true
 	}
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
-	Op := Op{
+	op := Op{
 		Type:      Query,
 		ClientID:  args.ClientID,
 		RequestID: args.RequestID,
 		Num:       args.Num,
 	}
 
-	index, _, isLeader := sm.rf.Start(Op)
-	if !isLeader {
-		reply.WrongLeader = true
-		return
-	}
-
-	sm.mu.Lock()
-	ch, ok := sm.notifyCh[index]
-	if !ok {
-		ch = make(chan OpResult, 1)
-		sm.notifyCh[index] = ch
-	}
-	sm.mu.Unlock()
-
-	defer func() {
-		sm.mu.Lock()
-		delete(sm.notifyCh, index)
-		sm.mu.Unlock()
-	}()
-
-	select {
-	case result := <-ch:
-		if result.ClientID == args.ClientID && result.RequestID == args.RequestID {
-			reply.WrongLeader = false
-			reply.Err = result.Err
-			reply.Config = result.Config
-		} else {
-			reply.WrongLeader = true
-		}
-	case <-time.After(100 * time.Millisecond):
+	result, ok := sm.submitAndWait(op)
+	if ok {
+		reply.WrongLeader = false
+		reply.Err = result.Err
+		reply.Config = result.Config
+	} else {
 		reply.WrongLeader = true
 	}
 }
@@ -255,6 +186,7 @@ func (sm *ShardMaster) apply(msg raft.ApplyMsg) {
 	ch, chExist := sm.notifyCh[msg.CommandIndex]
 	sm.mu.Unlock()
 	if ok && lastOp.RequestID >= op.RequestID {
+		// 这里只有 Leader 才会创建 notifyCh
 		if chExist {
 			ch <- lastOp.Result
 		}
@@ -284,7 +216,9 @@ func (sm *ShardMaster) apply(msg raft.ApplyMsg) {
 
 		// 把新 group 加入 Groups
 		for gid, servers := range op.Servers {
-			newConfig.Groups[gid] = servers
+			copied := make([]string, len(servers))
+			copy(copied, servers)
+			newConfig.Groups[gid] = copied
 		}
 
 		// reBalancing

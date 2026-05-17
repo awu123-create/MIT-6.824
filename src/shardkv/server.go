@@ -123,7 +123,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
-	
+
 	ch, ok := kv.notifyCh[index]
 	if !ok {
 		ch = make(chan OpResult, 1)
@@ -173,7 +173,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
-	
+
 	ch, ok := kv.notifyCh[index]
 	if !ok {
 		ch = make(chan OpResult, 1)
@@ -238,7 +238,7 @@ func (kv *ShardKV) GC(args *GCArgs, reply *GCReply) {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
-	}else if args.ConfigNum < kv.currentConfig.Num {
+	} else if args.ConfigNum < kv.currentConfig.Num {
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
@@ -322,12 +322,19 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 	}
 
 	defer func() {
+		// 锁内生成快照，rf.Snapshot在锁外调用，避免长时间持有锁
 		kv.mu.Lock()
-		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
-			kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
+		shouldSnapshot := kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate
+		var snapshot []byte
+		if shouldSnapshot {
+			snapshot = kv.makeSnapshot()
 		}
 		kv.lastAppliedSnapshotIndex = msg.CommandIndex
 		kv.mu.Unlock()
+
+		if shouldSnapshot {
+			kv.rf.Snapshot(msg.CommandIndex, snapshot)
+		}
 	}()
 
 	op := msg.Command.(Op)
@@ -337,7 +344,6 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 	ch, chExist := kv.notifyCh[msg.CommandIndex]
 	kv.mu.Unlock()
 
-	kv.mu.Lock()
 	if !kv.canServe(op.Key) && (op.Type == "Get" || op.Type == "Put" || op.Type == "Append") {
 		if chExist {
 			ch <- OpResult{
@@ -346,19 +352,12 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 				RequestID: op.RequestID,
 			}
 		}
-		kv.mu.Unlock()
+
 		return
 	}
-	kv.mu.Unlock()
 
 	if ok && lastOp.RequestID >= op.RequestID && (op.Type == "Get" || op.Type == "Put" || op.Type == "Append") {
-		// kv.mu.Lock()
-		// if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
-		// 	kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
-		// }
-		// kv.lastAppliedSnapshotIndex = msg.CommandIndex
-		// kv.mu.Unlock()
-
+		// 此时处理的是到达的重复请求，直接返回上次的结果
 		if chExist {
 			ch <- lastOp.Result
 			return
@@ -394,23 +393,20 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 					meta.State = Serving
 					meta.FromGID = 0
 					meta.ToGID = 0
-					meta.PendingGC = false
 				} else if kv.lastConfig.Shards[i] == kv.gid && kv.currentConfig.Shards[i] != kv.gid {
 					meta.State = BePushing
 					meta.FromGID = 0
 					meta.ToGID = kv.currentConfig.Shards[i]
-					meta.PendingGC = false
 				} else if kv.lastConfig.Shards[i] == 0 && kv.currentConfig.Shards[i] == kv.gid {
 					meta.State = Serving
 					meta.FromGID = 0
 					meta.ToGID = 0
-					meta.PendingGC = false
 				} else if kv.lastConfig.Shards[i] != kv.gid && kv.currentConfig.Shards[i] == kv.gid {
 					meta.State = BePulling
 					meta.FromGID = kv.lastConfig.Shards[i]
 					meta.ToGID = 0
-					meta.PendingGC = false
 				}
+				meta.PendingGC = false
 				kv.shardState[i] = meta
 			}
 		}
@@ -649,7 +645,9 @@ func (kv *ShardKV) puller() {
 
 					_, _, isLeader := kv.rf.Start(op)
 					if !isLeader {
+						kv.mu.Lock()
 						delete(kv.pullInFlight, key)
+						kv.mu.Unlock()
 						continue
 					}
 				}
@@ -722,7 +720,9 @@ func (kv *ShardKV) gcTicker() {
 
 					_, _, isLeader := kv.rf.Start(op)
 					if !isLeader {
+						kv.mu.Lock()
 						delete(kv.gcInFlight, key)
+						kv.mu.Unlock()
 						continue
 					}
 				}
@@ -754,7 +754,8 @@ func (kv *ShardKV) makeSnapshot() []byte {
 }
 
 func (kv *ShardKV) readSnapshot(data []byte) {
-	if data == nil || len(data) < 1 {
+	// 拦截 nil 和空快照
+	if len(data) == 0 {
 		return
 	}
 
