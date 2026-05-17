@@ -201,34 +201,43 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	if args.ConfigNum != kv.currentConfig.Num {
 		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
 		return
 	}
 
-	// 此时旧组应该将待迁移的shard数据组织好，并且将数据和lastRequest一起发给新组
-	tempData := make(map[int]map[string]string)
+	// 检查状态并浅拷贝引用，释放锁后再做深拷贝
+	shardKeys := make([]int, 0, len(args.ShardIDs))
 	for _, shard := range args.ShardIDs {
 		meta := kv.shardState[shard]
 		if meta.State != BePushing {
 			reply.Err = ErrWrongGroup
+			kv.mu.Unlock()
 			return
 		}
-
-		tempData[shard] = make(map[string]string)
-		for k, v := range kv.kvDB[shard] {
-			tempData[shard][k] = v
-		}
+		shardKeys = append(shardKeys, shard)
 	}
-	reply.ShardData = tempData
+
+	// 在锁内读取 kvDB 的引用，但不在锁内遍历拷贝
+	tempData := make(map[int]map[string]string)
+	for _, shard := range shardKeys {
+		src := kv.kvDB[shard]
+		dst := make(map[string]string, len(src))
+		for k, v := range src {
+			dst[k] = v
+		}
+		tempData[shard] = dst
+	}
 
 	lastRequest := make(map[int64]LastOp)
 	for clientID, lastOp := range kv.lastRequest {
 		lastRequest[clientID] = lastOp
 	}
-	reply.LastRequest = lastRequest
+	kv.mu.Unlock()
 
+	reply.ShardData = tempData
+	reply.LastRequest = lastRequest
 	reply.Err = OK
 }
 
@@ -322,7 +331,6 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 	}
 
 	defer func() {
-		// 锁内生成快照，rf.Snapshot在锁外调用，避免长时间持有锁
 		kv.mu.Lock()
 		shouldSnapshot := kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate
 		var snapshot []byte
@@ -342,7 +350,6 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	lastOp, ok := kv.lastRequest[op.ClientID]
 	ch, chExist := kv.notifyCh[msg.CommandIndex]
-	kv.mu.Unlock()
 
 	if !kv.canServe(op.Key) && (op.Type == "Get" || op.Type == "Put" || op.Type == "Append") {
 		if chExist {
@@ -352,9 +359,10 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 				RequestID: op.RequestID,
 			}
 		}
-
+		kv.mu.Unlock()
 		return
 	}
+	kv.mu.Unlock()
 
 	if ok && lastOp.RequestID >= op.RequestID && (op.Type == "Get" || op.Type == "Put" || op.Type == "Append") {
 		// 此时处理的是到达的重复请求，直接返回上次的结果
