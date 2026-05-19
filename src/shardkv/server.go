@@ -70,9 +70,10 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	dead        int32
-	lastRequest map[int64]LastOp
-	notifyCh    map[int]chan OpResult
+	dead          int32
+	lastRequest   map[int64]LastOp
+	notifyCh      map[int]chan OpResult
+	pendingResult map[int]OpResult
 
 	mck *shardmaster.Clerk
 
@@ -109,6 +110,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
+	kv.mu.Unlock()
 
 	Op := Op{
 		Type:      "Get",
@@ -120,10 +122,21 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	index, _, isLeader := kv.rf.Start(Op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
 		return
 	}
 
+	kv.mu.Lock()
+	if result, ok := kv.pendingResult[index]; ok {
+		delete(kv.pendingResult, index)
+		kv.mu.Unlock()
+		if result.ClientID == args.ClientID && result.RequestID == args.RequestID {
+			reply.Err = result.Err
+			reply.Value = result.Value
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+		return
+	}
 	ch, ok := kv.notifyCh[index]
 	if !ok {
 		ch = make(chan OpResult, 1)
@@ -158,6 +171,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
+	kv.mu.Unlock()
 
 	Op := Op{
 		Type:      args.Op,
@@ -170,10 +184,20 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	index, _, isLeader := kv.rf.Start(Op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
 		return
 	}
 
+	kv.mu.Lock()
+	if result, ok := kv.pendingResult[index]; ok {
+		delete(kv.pendingResult, index)
+		kv.mu.Unlock()
+		if result.ClientID == args.ClientID && result.RequestID == args.RequestID {
+			reply.Err = result.Err
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+		return
+	}
 	ch, ok := kv.notifyCh[index]
 	if !ok {
 		ch = make(chan OpResult, 1)
@@ -317,6 +341,27 @@ func (kv *ShardKV) applier() {
 	}
 }
 
+func (kv *ShardKV) notifyLocked(index int, result OpResult) {
+	ch, ok := kv.notifyCh[index]
+	if !ok {
+		kv.pendingResult[index] = result
+		return
+	}
+
+	select {
+	case ch <- result:
+	default:
+	}
+}
+
+func (kv *ShardKV) cleanupPendingResultLocked(appliedIndex int) {
+	for index := range kv.pendingResult {
+		if index+1024 < appliedIndex {
+			delete(kv.pendingResult, index)
+		}
+	}
+}
+
 func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 	if !msg.CommandValid && msg.SnapshotValid {
 		kv.mu.Lock()
@@ -326,6 +371,8 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 		}
 		kv.lastAppliedSnapshotIndex = msg.SnapshotIndex
 		kv.readSnapshot(msg.Snapshot)
+		kv.notifyCh = make(map[int]chan OpResult)
+		kv.pendingResult = make(map[int]OpResult)
 		kv.mu.Unlock()
 		return
 	}
@@ -338,6 +385,7 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 			snapshot = kv.makeSnapshot()
 		}
 		kv.lastAppliedSnapshotIndex = msg.CommandIndex
+		kv.cleanupPendingResultLocked(msg.CommandIndex)
 		kv.mu.Unlock()
 
 		if shouldSnapshot {
@@ -346,40 +394,36 @@ func (kv *ShardKV) apply(msg raft.ApplyMsg) {
 	}()
 
 	op := msg.Command.(Op)
+	isClientOp := op.Type == "Get" || op.Type == "Put" || op.Type == "Append"
 
 	kv.mu.Lock()
 	lastOp, ok := kv.lastRequest[op.ClientID]
-	ch, chExist := kv.notifyCh[msg.CommandIndex]
 
-	if !kv.canServe(op.Key) && (op.Type == "Get" || op.Type == "Put" || op.Type == "Append") {
-		if chExist {
-			ch <- OpResult{
-				Err:       ErrWrongGroup,
-				ClientID:  op.ClientID,
-				RequestID: op.RequestID,
-			}
-		}
+	if !kv.canServe(op.Key) && isClientOp {
+		kv.notifyLocked(msg.CommandIndex, OpResult{
+			Err:       ErrWrongGroup,
+			ClientID:  op.ClientID,
+			RequestID: op.RequestID,
+		})
+		kv.mu.Unlock()
+		return
+	}
+
+	if ok && lastOp.RequestID >= op.RequestID && isClientOp {
+		// 此时处理的是到达的重复请求，直接返回上次的结果
+		kv.notifyLocked(msg.CommandIndex, lastOp.Result)
 		kv.mu.Unlock()
 		return
 	}
 	kv.mu.Unlock()
 
-	if ok && lastOp.RequestID >= op.RequestID && (op.Type == "Get" || op.Type == "Put" || op.Type == "Append") {
-		// 此时处理的是到达的重复请求，直接返回上次的结果
-		if chExist {
-			ch <- lastOp.Result
-			return
-		}
-		return
-	}
-
 	switch op.Type {
 	case "Get", "Put", "Append":
 		result := kv.applyClientRequest(op, key2shard(op.Key))
 
-		if chExist {
-			ch <- result
-		}
+		kv.mu.Lock()
+		kv.notifyLocked(msg.CommandIndex, result)
+		kv.mu.Unlock()
 
 	case "Config":
 		// 此时需要更新当前配置
@@ -845,6 +889,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.lastRequest = make(map[int64]LastOp)
 	kv.notifyCh = make(map[int]chan OpResult)
+	kv.pendingResult = make(map[int]OpResult)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.kvDB = make(map[int]map[string]string)
 	for i := 0; i < shardmaster.NShards; i++ {

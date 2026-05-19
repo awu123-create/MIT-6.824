@@ -1,6 +1,7 @@
 package shardmaster
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,11 +23,15 @@ type ShardMaster struct {
 	configs []Config // indexed by config num
 
 	// 去重
-	lastRequest map[int64]LastOp      // key: ClientID
-	notifyCh    map[int]chan OpResult
+	lastRequest              map[int64]LastOp // key: ClientID
+	notifyCh                 map[int]chan OpResult
+	pendingResult            map[int]OpResult
+	lastAppliedSnapshotIndex int
 }
 
 type CommandType int
+
+const shardMasterMaxRaftState = 10000
 
 const (
 	Join CommandType = iota
@@ -74,6 +79,14 @@ func (sm *ShardMaster) submitAndWait(op Op) (OpResult, bool) {
 	}
 
 	sm.mu.Lock()
+	if result, ok := sm.pendingResult[index]; ok {
+		delete(sm.pendingResult, index)
+		sm.mu.Unlock()
+		if result.ClientID == op.ClientID && result.RequestID == op.RequestID {
+			return result, true
+		}
+		return OpResult{}, false
+	}
 	ch, ok := sm.notifyCh[index]
 	if !ok {
 		ch = make(chan OpResult, 1)
@@ -178,20 +191,73 @@ func (sm *ShardMaster) applier() {
 	}
 }
 
+func (sm *ShardMaster) notifyLocked(index int, result OpResult) {
+	ch, ok := sm.notifyCh[index]
+	if !ok {
+		sm.pendingResult[index] = result
+		return
+	}
+
+	select {
+	case ch <- result:
+	default:
+	}
+}
+
+func (sm *ShardMaster) cleanupPendingResultLocked(appliedIndex int) {
+	for index := range sm.pendingResult {
+		if index+1024 < appliedIndex {
+			delete(sm.pendingResult, index)
+		}
+	}
+}
+
 func (sm *ShardMaster) apply(msg raft.ApplyMsg) {
+	if !msg.CommandValid && msg.SnapshotValid {
+		sm.mu.Lock()
+		if msg.SnapshotIndex <= sm.lastAppliedSnapshotIndex {
+			sm.mu.Unlock()
+			return
+		}
+		sm.lastAppliedSnapshotIndex = msg.SnapshotIndex
+		sm.readSnapshot(msg.Snapshot)
+		sm.notifyCh = make(map[int]chan OpResult)
+		sm.pendingResult = make(map[int]OpResult)
+		sm.mu.Unlock()
+		return
+	}
+
+	if !msg.CommandValid {
+		return
+	}
+
+	defer func() {
+		sm.mu.Lock()
+		shouldSnapshot := sm.rf.GetRaftStateSize() > shardMasterMaxRaftState
+		var snapshot []byte
+		if shouldSnapshot {
+			snapshot = sm.makeSnapshot()
+		}
+		sm.lastAppliedSnapshotIndex = msg.CommandIndex
+		sm.cleanupPendingResultLocked(msg.CommandIndex)
+		sm.mu.Unlock()
+
+		if shouldSnapshot {
+			sm.rf.Snapshot(msg.CommandIndex, snapshot)
+		}
+	}()
+
 	op := msg.Command.(Op)
 
 	sm.mu.Lock()
 	lastOp, ok := sm.lastRequest[op.ClientID]
-	ch, chExist := sm.notifyCh[msg.CommandIndex]
-	sm.mu.Unlock()
 	if ok && lastOp.RequestID >= op.RequestID {
 		// 这里只有 Leader 才会创建 notifyCh
-		if chExist {
-			ch <- lastOp.Result
-		}
+		sm.notifyLocked(msg.CommandIndex, lastOp.Result)
+		sm.mu.Unlock()
 		return
 	}
+	sm.mu.Unlock()
 
 	result := OpResult{
 		ClientID:  op.ClientID,
@@ -262,9 +328,36 @@ func (sm *ShardMaster) apply(msg raft.ApplyMsg) {
 	}
 	sm.mu.Unlock()
 
-	if chExist {
-		ch <- result
+	sm.mu.Lock()
+	sm.notifyLocked(msg.CommandIndex, result)
+	sm.mu.Unlock()
+}
+
+func (sm *ShardMaster) makeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(sm.configs)
+	e.Encode(sm.lastRequest)
+	return w.Bytes()
+}
+
+func (sm *ShardMaster) readSnapshot(data []byte) {
+	if len(data) == 0 {
+		return
 	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var configs []Config
+	var lastRequest map[int64]LastOp
+
+	if d.Decode(&configs) != nil || d.Decode(&lastRequest) != nil {
+		panic("failed to read shardmaster snapshot")
+	}
+
+	sm.configs = configs
+	sm.lastRequest = lastRequest
 }
 
 func DeepCopy(config Config) Config {
@@ -320,6 +413,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	// Your code here.
 	sm.lastRequest = make(map[int64]LastOp)
 	sm.notifyCh = make(map[int]chan OpResult)
+	sm.pendingResult = make(map[int]OpResult)
+	sm.readSnapshot(persister.ReadSnapshot())
 
 	go sm.applier()
 

@@ -96,8 +96,6 @@ func (ck *Clerk) Get(key string) string {
 		
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 // shared by Put and Append.

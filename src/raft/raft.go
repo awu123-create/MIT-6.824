@@ -1450,6 +1450,7 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 				SnapshotIndex: rf.snapshotIndex,
 				SnapshotTerm:  rf.snapshotTerm,
 			})
+			rf.hasSnapshot = false
 		}
 
 		for rf.lastApplied < rf.commitIndex && rf.lastApplied < rf.lastLogIndex() {
@@ -1462,7 +1463,15 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 		}
 		rf.mu.Unlock()
 		for _, msg := range entries {
-			applyCh <- msg
+			for !rf.killed() {
+				select {
+				case applyCh <- msg:
+					goto nextEntry
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+			return
+		nextEntry:
 		}
 	}
 }
